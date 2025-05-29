@@ -1,0 +1,2558 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from tabulate import tabulate
+import math
+import tkinter as tk
+from tkinter import ttk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+class Load:
+    def __init__(self, load_type, value, position=None, start=None, end=None, direction='down'):
+        self.type = load_type
+        self.value = value
+        self.position = position
+        self.start = start
+        self.end = end
+        self.direction = direction
+
+class Beam:
+    def __init__(self, length, supports, E=None, I=None):
+        self.length = length
+        self.supports = supports  # Список словарей опор
+        self.E = E
+        self.I = I
+        self.loads = []
+        self.reactions = {}
+        self.segments = []
+
+    def degree_of_indeterminacy(self):
+        reactions_count = 0
+        for support in self.supports:
+            if support['type'] == 'fixed':
+                reactions_count += 2  # Учитываем вертикальную реакцию и момент
+            elif support['type'] == 'fixed_support':
+                reactions_count += 1  # Только вертикальная реакция
+            elif support['type'] == 'roller':
+                reactions_count += 1  # Вертикальная реакция
+        # Уравнения равновесия: ΣFy=0, ΣM=0 (ΣFx=0 не требуется, так как горизонтальных нагрузок нет)
+        return reactions_count - 2
+
+
+    def add_load(self, load):
+        self.loads.append(load)
+
+
+    def _update_segments(self):
+        merge_threshold = 1e-6  # Порог объединения точек       
+        points = set()
+        
+        # Добавляем точки с округлением до 6 знаков
+        for load in self.loads:
+            if load.type == 'force':
+                points.add(round(load.position, 6))
+            elif load.type == 'distributed':
+                points.add(round(load.start, 6))
+                points.add(round(load.end, 6))
+            elif load.type == 'moment':
+                points.add(round(load.position, 6))
+        
+        # Добавляем опоры с округлением
+        for support in self.supports:
+            points.add(round(support['position'], 6))
+        
+        # Добавляем начало и конец балки
+        points.add(0.0)
+        points.add(round(self.length, 6))
+        
+        # Сортируем и объединяем близкие точки
+        sorted_points = sorted(points)
+        merged_points = []
+        
+        for p in sorted_points:
+            if not merged_points or p - merged_points[-1] > merge_threshold:
+                merged_points.append(p)
+            else:
+                # Объединяем с предыдущей точкой
+                merged_points[-1] = (merged_points[-1] + p)/2
+        
+        # Формируем сегменты
+        self.segments = []
+        for i in range(len(merged_points)-1):
+            start = merged_points[i]
+            end = merged_points[i+1]
+            
+            if end - start > merge_threshold:
+                self.segments.append((start, end))
+        
+
+    def calculate_reactions(self):
+        n = self.degree_of_indeterminacy()
+        if n == 0:
+            if len(self.supports) == 1 and self.supports[0]['type'] == 'fixed':
+                # Заделка
+                sum_F = sum_M = 0
+                for load in self.loads:
+                    if load.type == 'force':
+                        F = load.value * (-1 if load.direction == 'down' else 1)
+                        sum_F += F
+                        sum_M -= F * load.position
+                    elif load.type == 'distributed':
+                        q = load.value * (-1 if load.direction == 'down' else 1)
+                        L = load.end - load.start
+                        sum_F += q * L
+                        sum_M -= q * L * (load.start + L/2)
+                    elif load.type == 'moment':
+                        M = load.value * (1 if load.direction == 'ccw' else -1)
+                        sum_M -= M
+                self.reactions = {'R': -sum_F, 'M': -sum_M}
+                return
+            elif len(self.supports) == 2:
+                # Две опоры
+                x1 = self.supports[0]['position']
+                x2 = self.supports[1]['position']
+                sum_F = sum_M = 0
+                for load in self.loads:
+                    if load.type == 'force':
+                        F = load.value * (-1 if load.direction == 'down' else 1)
+                        sum_F += F
+                        sum_M += F * (load.position - x1)
+                    elif load.type == 'distributed':
+                        q = load.value * (-1 if load.direction == 'down' else 1)
+                        L = load.end - load.start
+                        sum_F += q * L
+                        sum_M += q * L * (load.start + L/2 - x1)
+                    elif load.type == 'moment':
+                        M = load.value * (1 if load.direction == 'ccw' else -1)
+                        sum_M += M
+                try:
+                    R2 = (-sum_M) / (x2 - x1)
+                    R1 = -sum_F - R2
+                    self.reactions = {'R1': R1, 'R2': R2}
+                    return
+                except ZeroDivisionError:
+                    raise ValueError("Опоры не могут совпадать")
+
+        # Случай двух неподвижных шарниров (1 степень)
+        elif n == 1:
+            if len(self.supports) == 2 and all(s['type'] == 'fixed_support' for s in self.supports):
+                # Рассчитываем как для системы с 1 подвижной опорой
+                x1, x2 = sorted([s['position'] for s in self.supports])
+                
+                # Временная замена правой опоры на подвижную
+                temp_beam = Beam(self.length, [
+                    {'type': 'fixed_support', 'position': x1},
+                    {'type': 'roller', 'position': x2}
+                ], self.E, self.I)
+                
+                # Копируем все нагрузки
+                temp_beam.loads = self.loads.copy()
+                temp_beam.calculate_reactions()
+                
+                # Реакции будут идентичны исходной системе
+                self.reactions = temp_beam.reactions.copy()
+                return
+            
+            # Случай 2: 1 fixed_support + 2 roller
+            elif (len(self.supports) == 3 
+                and sum(s['type'] == 'fixed_support' for s in self.supports) == 1
+                and sum(s['type'] == 'roller' for s in self.supports) == 2):
+
+                sorted_sups = sorted(self.supports, key=lambda s: s['position'])
+                main_sup = [s for s in sorted_sups if s['type'] == 'fixed_support'][0]
+                removed_sup = sorted_sups[1]  # Удаляем среднюю опору
+
+                # Основная система: fixed_support + дальняя roller
+                main_beam = Beam(self.length, [main_sup, sorted_sups[2]], self.E, self.I)
+                main_beam.loads = self.loads.copy()
+                main_beam.calculate_reactions()
+
+                # Прогиб в точке удаленной опоры
+                delta_p = main_beam.compute_deflection_at(removed_sup['position'])
+
+                # Единичная нагрузка ВВЕРХ
+                unit_beam = Beam(self.length, [main_sup, sorted_sups[2]], self.E, self.I)
+                unit_beam.add_load(Load('force', 1.0, removed_sup['position'], direction='up'))
+                unit_beam.calculate_reactions()
+                delta_1 = unit_beam.compute_deflection_at(removed_sup['position'])
+
+                X = -delta_p / delta_1
+
+                # Формируем реакции с явными ключами
+                self.reactions = {
+                    f'R_{main_sup["position"]}': main_beam.reactions.get(f'R_{main_sup["position"]}', 0) + X * unit_beam.reactions.get(f'R_{main_sup["position"]}', 0),
+                    f'R_{sorted_sups[2]["position"]}': main_beam.reactions.get(f'R_{sorted_sups[2]["position"]}', 0) + X * unit_beam.reactions.get(f'R_{sorted_sups[2]["position"]}', 0),
+                    f'R_{removed_sup["position"]}': X
+                }
+                return
+            else:
+                # Метод Мора для 1 степени неопределённости
+                main_supports = self.supports[:-1]
+                removed_support = self.supports[-1]
+                pos = removed_support['position']
+                
+                # Основная система
+                main_beam = Beam(self.length, main_supports, self.E, self.I)
+                main_beam.loads = self.loads.copy()
+                main_beam.calculate_reactions()
+                
+                delta_p = main_beam.compute_deflection_at(pos)
+                
+                # Единичная нагрузка направлена вверх
+                unit_beam = Beam(self.length, main_supports, self.E, self.I)
+                unit_beam.add_load(Load('force', 1.0, pos, direction='up'))
+                unit_beam.calculate_reactions()
+                delta_1 = unit_beam.compute_deflection_at(pos)
+                
+                if abs(delta_1) < 1e-10:
+                    raise ValueError("Невозможно решить: delta_1 = 0")
+                
+                X = -delta_p / delta_1
+                
+                # Корректное объединение реакций с учётом направления
+                self.reactions = main_beam.reactions.copy()
+                for key in unit_beam.reactions:
+                    self.reactions[key] = self.reactions.get(key, 0) + X * unit_beam.reactions[key]
+                # Добавляем реакцию удалённой опоры
+                self.reactions[f'R{len(self.supports)}'] = X
+                return
+        elif n == 2:
+            self._calculate_indeterminate_2()
+        else:
+            raise NotImplementedError("Степень неопределенности >2 не поддерживается")
+        
+    def _calculate_indeterminate_2(self):
+        # Случай: Заделка + 2 ролика
+        if (len(self.supports) == 3 
+            and any(s['type'] == 'fixed' for s in self.supports)
+            and sum(1 for s in self.supports if s['type'] == 'roller') == 2):
+
+            fixed = [s for s in self.supports if s['type'] == 'fixed'][0]
+            rollers = sorted([s for s in self.supports if s['type'] == 'roller'], 
+                            key=lambda x: x['position'])
+            pos1, pos2 = rollers[0]['position'], rollers[1]['position']
+
+            # Основная система (только заделка)
+            main_beam = Beam(self.length, [fixed], self.E, self.I)
+            main_beam.loads = self.loads.copy()
+            main_beam.calculate_reactions()
+
+            # Прогибы от внешних нагрузок (со знаком "+", так как направление вниз)
+            delta_p1 = main_beam.compute_deflection_at(pos1)
+            delta_p2 = main_beam.compute_deflection_at(pos2)
+
+            # Единичные нагрузки направлены ВНИЗ (изменено с 'up' на 'down')
+            unit_beam1 = Beam(self.length, [fixed], self.E, self.I)
+            unit_beam1.add_load(Load('force', 1.0, pos1, direction='down'))  # <- изменено
+            unit_beam1.calculate_reactions()
+            delta_11 = unit_beam1.compute_deflection_at(pos1)
+            delta_21 = unit_beam1.compute_deflection_at(pos2)
+
+            unit_beam2 = Beam(self.length, [fixed], self.E, self.I)
+            unit_beam2.add_load(Load('force', 1.0, pos2, direction='down'))  # <- изменено
+            unit_beam2.calculate_reactions()
+            delta_12 = unit_beam2.compute_deflection_at(pos1)
+            delta_22 = unit_beam2.compute_deflection_at(pos2)
+
+            # Матрица коэффициентов (знаки остаются прежними)
+            A = np.array([[delta_11, delta_12], 
+                        [delta_21, delta_22]])
+            # Вектор свободных членов (знаки изменены на противоположные)
+            B = np.array([delta_p1, delta_p2])  # <- убраны минусы
+            X = np.linalg.solve(A, B)
+
+            # Формирование реакций (знаки реакций инвертированы)
+            self.reactions = {
+                'R_fixed': main_beam.reactions.get('R', 0) - X[0] - X[1],  # "-" вместо "+"
+                'M_fixed': (main_beam.reactions.get('M', 0) 
+                        + X[0] * pos1  # "+" вместо "-"
+                        + X[1] * pos2), # "+" вместо "-"
+                'R_roller1': X[0],
+                'R_roller2': X[1]
+            }
+            return
+        
+        # Случай: Заделка + fixed_support (n=2)
+        elif (len(self.supports) == 2 
+            and any(s['type'] == 'fixed' for s in self.supports) 
+            and any(s['type'] == 'fixed_support' for s in self.supports)):
+
+            fixed = [s for s in self.supports if s['type'] == 'fixed'][0]
+            fixed_sup = [s for s in self.supports if s['type'] == 'fixed_support'][0]
+            
+            # Основная система: заменяем заделку на шарнир
+            main_supports = [
+                {'type': 'fixed_support', 'position': fixed['position']},
+                {'type': 'roller', 'position': fixed_sup['position']}
+            ]
+            
+            main_beam = Beam(self.length, main_supports, self.E, self.I)
+            main_beam.loads = self.loads.copy()
+            main_beam.calculate_reactions()
+
+            # Прогиб и угол поворота от внешних нагрузок
+            delta_p_rot = main_beam.compute_rotation_at(fixed['position'])
+            delta_p_def = main_beam.compute_deflection_at(fixed_sup['position'])
+
+            # Единичные системы:
+            # 1. Момент в заделке (X1)
+            unit_moment = Beam(self.length, main_supports, self.E, self.I)
+            unit_moment.add_load(Load('moment', 1.0, fixed['position'], direction='ccw'))
+            delta_11_rot = unit_moment.compute_rotation_at(fixed['position'])
+            delta_12_def = unit_moment.compute_deflection_at(fixed_sup['position'])
+
+            # 2. Вертикальная сила в ролике (X2)
+            unit_force = Beam(self.length, main_supports, self.E, self.I)
+            unit_force.add_load(Load('force', 1.0, fixed_sup['position'], direction='up'))
+            delta_21_rot = unit_force.compute_rotation_at(fixed['position'])
+            delta_22_def = unit_force.compute_deflection_at(fixed_sup['position'])
+
+            # Матрица коэффициентов
+            A = np.array([[delta_11_rot, delta_21_rot],
+                        [delta_12_def, delta_22_def]])
+            B = np.array([-delta_p_rot, -delta_p_def])
+            X = np.linalg.solve(A, B)
+
+            # Корректировка реакций
+            self.reactions = {
+                'R_fixed': main_beam.reactions.get('R1', 0) + X[0],
+                'M_fixed': X[0],
+                'R_support': X[1]
+            }
+            return
+        # Случай 8: 1 fixed_support + 3 roller
+        elif (len(self.supports) == 4 
+            and sum(s['type'] == 'fixed_support' for s in self.supports) == 1
+            and sum(s['type'] == 'roller' for s in self.supports) == 3):
+            
+            fixed = [s for s in self.supports if s['type'] == 'fixed_support'][0]
+            rollers = sorted([s for s in self.supports if s['type'] == 'roller'], 
+                            key=lambda x: x['position'])
+            # Удаляем два ролика
+            removed_rollers = rollers[1:]
+            pos1, pos2 = [r['position'] for r in removed_rollers]
+            
+            # Основная система: fixed_support + первый ролик
+            main_supports = [fixed, rollers[0]]
+            main_beam = Beam(self.length, main_supports, self.E, self.I)
+            main_beam.loads = self.loads.copy()
+            main_beam.calculate_reactions()
+            
+            # Прогибы от внешней нагрузки
+            delta_p1 = main_beam.compute_deflection_at(pos1)
+            delta_p2 = main_beam.compute_deflection_at(pos2)
+            
+            # Единичные нагрузки
+            unit_beam1 = Beam(self.length, main_supports, self.E, self.I)
+            unit_beam1.add_load(Load('force', 1.0, pos1, direction='up'))
+            unit_beam1.calculate_reactions()
+            delta_11 = unit_beam1.compute_deflection_at(pos1)
+            delta_21 = unit_beam1.compute_deflection_at(pos2)
+            
+            unit_beam2 = Beam(self.length, main_supports, self.E, self.I)
+            unit_beam2.add_load(Load('force', 1.0, pos2, direction='up'))
+            unit_beam2.calculate_reactions()
+            delta_12 = unit_beam2.compute_deflection_at(pos1)
+            delta_22 = unit_beam2.compute_deflection_at(pos2)
+            
+            # Решаем систему
+            A = np.array([[delta_11, delta_12], [delta_21, delta_22]])
+            B = np.array([-delta_p1, -delta_p2])
+            X = np.linalg.solve(A, B)
+            
+            # Корректируем реакции
+            self.reactions = {
+                f'R_{fixed["position"]}': (main_beam.reactions.get(f'R_{fixed["position"]}', 0) 
+                                        + X[0] * unit_beam1.reactions.get(f'R_{fixed["position"]}', 0)
+                                        + X[1] * unit_beam2.reactions.get(f'R_{fixed["position"]}', 0)),
+                f'R_{rollers[0]["position"]}': (main_beam.reactions.get(f'R_{rollers[0]["position"]}', 0) 
+                                            + X[0] * unit_beam1.reactions.get(f'R_{rollers[0]["position"]}', 0)
+                                            + X[1] * unit_beam2.reactions.get(f'R_{rollers[0]["position"]}', 0)),
+                f'R_{pos1}': X[0],
+                f'R_{pos2}': X[1]
+            }
+            return
+        else:
+            raise NotImplementedError("Данная конфигурация опор не поддерживается")
+        
+    def compute_deflection_at(self, x_point):
+        x, _, w = self.calculate_deflections()
+        idx = np.searchsorted(x, x_point)
+        
+        # Добавляем защиту от нулевых перемещений
+        if abs(w[-1] - w[0]) < 1e-6:
+            return 0.0
+        if idx == 0:
+            return w[0]
+        elif idx == len(x):
+            return w[-1]
+        else:
+            x_prev = x[idx-1]
+            x_next = x[idx]
+            w_prev = w[idx-1]
+            w_next = w[idx]
+            return w_prev + (w_next - w_prev) * (x_point - x_prev) / (x_next - x_prev)
+        
+    def compute_rotation_at(self, x_point):
+        """Вычисляет угол поворота сечения балки в точке x_point."""
+        x, theta, _ = self.calculate_deflections()
+        idx = np.searchsorted(x, x_point)
+        
+        if idx == 0:
+            return theta[0]
+        elif idx >= len(x):
+            return theta[-1]
+        else:
+            # Линейная интерполяция между ближайшими точками
+            x_prev = x[idx-1]
+            x_next = x[idx]
+            theta_prev = theta[idx-1]
+            theta_next = theta[idx]
+            return theta_prev + (theta_next - theta_prev) * (x_point - x_prev) / (x_next - x_prev)
+
+    def calculate_deflections(self):
+        self._update_segments()
+        x = np.linspace(0, self.length, 20000)
+        M = np.array([self.compute_internal_forces(xi)[1] for xi in x])
+        
+        theta = np.zeros_like(x)
+        w = np.zeros_like(x)
+        dx = x[1] - x[0]
+        
+        # Интегрирование моментов
+        for i in range(1, len(x)):
+            theta[i] = theta[i-1] + (M[i-1] + M[i])/2 * dx
+        
+        # Интегрирование углов
+        for i in range(1, len(x)):
+            w[i] = w[i-1] + (theta[i-1] + theta[i])/2 * dx
+        
+        # Применение EI
+        if self.E and self.I:
+            EI = self.E * self.I
+            theta /= EI
+            w /= EI
+        
+        # Проверка случая 5 (1 fixed_support + 2 rollers)
+        is_case_5 = (
+            len(self.supports) == 3 
+            and sum(s['type'] == 'fixed_support' for s in self.supports) == 1
+            and sum(s['type'] == 'roller' for s in self.supports) == 2
+        )
+        
+        # Граничные условия
+        for support in self.supports:
+            pos = support['position']
+            idx = np.abs(x - pos).argmin()
+            w[idx] = 0.0  # Прогиб = 0 для всех опор
+            if support['type'] == 'fixed_support':
+                theta[idx] = 0.0  # Угол = 0 только для fixed_support
+        
+        return x, theta, w
+
+    def compute_internal_forces(self, x):
+        Q, M = 0, 0
+        # Добавляем обработку 8-го случая
+        if (len(self.supports) == 4 
+            and sum(s['type'] == 'fixed_support' for s in self.supports) == 1
+            and sum(s['type'] == 'roller' for s in self.supports) == 3):
+
+            Q, M = 0, 0
+            supports_sorted = sorted(self.supports, key=lambda s: s['position'])
+            
+            # Учет всех реакций (без инверсии знака)
+            for support in supports_sorted:
+                pos = support['position']
+                R = self.reactions.get(f'R_{pos}', 0)
+                if x >= pos:
+                    Q += R
+                    M += R * (x - pos)
+
+            # Учет внешних нагрузок
+            for load in self.loads:
+                if load.type == 'force' and x >= load.position:
+                    F = load.value * (-1 if load.direction == 'down' else 1)
+                    Q += F
+                    M += F * (x - load.position)
+                    
+                elif load.type == 'distributed':
+                    sign = -1 if load.direction == 'down' else 1
+                    q = sign * load.value
+                    start = load.start 
+                    end = load.end 
+                    if x >= end:
+                        delta = end - start  
+                        M += q * delta * (x - (start + end)/2)
+                        Q += q * delta
+                    elif x > start:
+                        delta = x - start
+                        Q += q * delta
+                        M += q * (delta**2)/2
+
+                elif load.type == 'moment' and x >= load.position:
+                    M += load.value * (1 if load.direction == 'cw' else -1)
+            
+            return Q, M
+        elif (len(self.supports) == 3 
+            and sum(s['type'] == 'fixed_support' for s in self.supports) == 1):
+
+            # Учет реакций по позициям опор
+            for support in self.supports:
+                pos = support['position']
+                R = self.reactions.get(f'R_{pos}', 0)
+                if x >= pos:
+                    Q += R
+                    M += R * (x - pos)
+            
+            # Учет внешних нагрузок
+            for load in self.loads:
+                if load.type == 'force':
+                    F = -load.value if load.direction == 'down' else load.value
+                    if x >= load.position:
+                        Q += F
+                        M += F * (x - load.position)
+                elif load.type == 'distributed':
+                    q = -load.value if load.direction == 'down' else load.value
+                    if x >= load.end:
+                        F = q * (load.end - load.start)
+                        Q += F
+                        M += F * (x - (load.start + load.end)/2)
+                    elif x > load.start:
+                        delta = x - load.start
+                        Q += q * delta
+                        M += q * (delta**2)/2
+                elif load.type == 'moment':
+                    # Учитываем момент только если x > позиции момента
+                    if x >= load.position:
+                        M += load.value if load.direction == 'cw' else -load.value
+            return Q, M
+        else:
+            # Учет реакций заделки
+            fixed_supports = [s for s in self.supports if s['type'] == 'fixed']
+            if fixed_supports:
+                fixed_support = fixed_supports[0]
+                R_fixed = self.reactions.get('R', self.reactions.get('R_fixed', 0))
+                M_fixed = self.reactions.get('M', self.reactions.get('M_fixed', 0))
+                Q += R_fixed
+                M += M_fixed
+                if x >= fixed_support['position']:
+                    M += R_fixed * (x - fixed_support['position'])
+
+            # Учет реакций других опор (roller, fixed_support)
+            # Создаем список опор, исключая заделку, и сортируем их по позиции
+            other_supports = sorted(
+                [s for s in self.supports if s['type'] != 'fixed'],
+                key=lambda s: s['position']
+            )
+            for i, support in enumerate(other_supports, start=1):
+                # Определяем возможные ключи для реакции опоры
+                possible_keys = [
+                    f'R{i}',  # по порядку после заделки
+                    f'R_{support["position"]}',  # по позиции
+                    f'R_roller{i}',  # для роликов
+                    f'R_support{i}',
+                    f'R{len(fixed_supports) + i}'  # если заделки есть, то R2, R3 и т.д.
+                ]
+                R = 0
+                for key in possible_keys:
+                    R = self.reactions.get(key, 0)
+                    if R != 0:
+                        break
+                
+                # Если не нашли, проверяем ключи типа 'R1', 'R2' по порядку всех опор
+                if R == 0:
+                    all_supports_sorted = sorted(self.supports, key=lambda s: s['position'])
+                    idx = all_supports_sorted.index(support) + 1
+                    R = self.reactions.get(f'R{idx}', 0)
+                
+                if x >= support['position']:
+                    Q += R
+                    M += R * (x - support['position'])
+
+            # Учет внешних нагрузок
+            for load in self.loads:
+                if load.type == 'force' and x >= load.position:
+                    F = load.value * (-1 if load.direction == 'down' else 1)
+                    Q += F
+                    M += F * (x - load.position)
+                    
+                elif load.type == 'distributed':
+                    sign = -1 if load.direction == 'down' else 1
+                    q = sign * load.value
+                    start = load.start 
+                    end = load.end 
+                    if x >= end:
+                        delta = end - start  
+                        M += q * delta * (x - (start + end)/2)
+                        Q += q * delta
+                    elif x > start:
+                        delta = x - start
+                        Q += q * delta
+                        M += q * (delta**2)/2
+
+                elif load.type == 'moment' and x >= load.position:
+                    M += load.value * (1 if load.direction == 'cw' else -1)
+            
+            return Q, M
+    
+    def _get_critical_points(self):
+        points = self.get_key_points()
+        critical = []
+
+        for x in points:
+            # Пропускаем граничные точки
+            if x in (0, self.length):
+                continue
+
+            # Проверка скачка для Q (только от сосредоточенных сил)
+            Q_left = self.compute_internal_forces(x - 1e-6)[0]
+            Q_right = self.compute_internal_forces(x + 1e-6)[0]
+            if any(load.type == 'force' and 
+                abs(load.position - x) < 1e-6 
+                for load in self.loads):
+                critical.append(('Q_jump', x, Q_left, Q_right))
+
+            # Проверка скачка для M (только от сосредоточенных моментов)
+            M_left = self.compute_internal_forces(x - 1e-6)[1]
+            M_right = self.compute_internal_forces(x + 1e-6)[1]
+            if any(load.type == 'moment' and 
+                abs(load.position - x) < 1e-6 
+                for load in self.loads):
+                critical.append(('M_jump', x, M_left, M_right))
+
+        return critical
+    
+    def plot_diagrams(self, fig=None):
+        plt.rcParams.update({
+            'hatch.linewidth': 0.3,
+            'hatch.color': '#404040',
+            'axes.titlepad': 25,  # Увеличиваем отступ заголовка
+            'axes.labelpad': 10    # Отступ подписей осей
+        })
+        
+        if fig is None:
+            fig = plt.figure(figsize=(12, 16))  # Увеличиваем ширину фигуры
+            fig.subplots_adjust(right=0.75)  # Освобождаем 25% пространства справа
+            fig.set_facecolor('#F5F5F5')
+        
+        # Создаем сетку с увеличенными расстояниями
+        gs = plt.GridSpec(5, 1, figure=fig, hspace=0.9)  # Вертикальный отступ 0.7
+        
+        axes = []
+        for i in range(5):
+            ax = fig.add_subplot(gs[i])
+            ax.set_xlim(0, self.length)
+            ax.tick_params(axis='both', colors='#333333')
+            
+            # Настройка осей
+            for spine in ['top', 'right']:
+                ax.spines[spine].set_visible(False)
+            ax.spines['bottom'].set_color('#666666')
+            ax.spines['left'].set_color('#666666')
+            axes.append(ax)
+
+        # Расчетная схема
+        self._draw_beam_scheme(axes[0])
+        
+        # Эпюра Q
+        self._plot_force_diagram(axes[1])
+        
+        # Эпюра M
+        self._plot_moment_diagram(axes[2])
+        # Проверка на случай 4: 2 неподвижные опоры (fixed_support)
+        num_fixed_supports = sum(1 for s in self.supports if s['type'] == 'fixed_support')
+        case_4 = (len(self.supports) == 2 and num_fixed_supports == 2)        
+        # Обработка эпюр деформаций
+        num_rollers = sum(1 for s in self.supports if s['type'] == 'roller')
+        # Случаи, когда не показываем эпюры деформаций
+        hide_deflections = (
+            case_4 or  # Наш 4-й случай
+            (len(self.supports) == 3 and num_fixed_supports == 1 and num_rollers == 2) or  # Случай 5
+            (len(self.supports) == 4 and num_fixed_supports == 1 and num_rollers == 3)     # Случай 8
+        )
+
+        # Отрисовка схемы и эпюр
+        self._draw_beam_scheme(axes[0])
+        self._plot_force_diagram(axes[1])
+        self._plot_moment_diagram(axes[2])        
+        # Удаляем эпюры деформаций для указанных случаев
+        if hide_deflections:
+            for ax in axes[3:]:
+                ax.remove()
+        else:
+            self._plot_theta_diagram(axes[3])
+            self._plot_w_diagram(axes[4])
+
+        # Дополнительные настройки расположения
+        plt.subplots_adjust(
+            top=0.95,    # Верхний отступ
+            bottom=0.05, # Нижний отступ
+            hspace=0.5   # Дублируем вертикальный отступ
+        )
+        return fig
+        
+    
+    def _plot_deflections(self, ax):
+        try:
+            x, theta, w = self.calculate_deflections()
+            ax.plot(x, theta, 'g--', label='Углы поворота (θ)')
+            ax.plot(x, w, 'm-', label='Прогибы (w)')
+            ax.set_title("Эпюры деформаций")
+            ax.grid(True)
+            ax.legend()
+            ax.set_xlabel("Длина балки, м")
+        except ValueError as e:
+            ax.text(0.5, 0.5, str(e), ha='center', va='center')
+            ax.set_title("Ошибка расчета деформаций")
+
+    def _draw_beam_scheme(self, ax):
+        ax.set_xlim(-1, self.length + 3)  # Расширяем правую границу для легенды
+        ax.set_ylim(-3, 3)
+        ax.hlines(0, 0, self.length, colors='k', lw=3)
+        ax.set_facecolor('white')
+        ax.set_xlim(0, self.length)  # Явная привязка к длине балки        
+        # Создаем легенду
+        legend_elements = []
+       
+        # Отрисовка опор
+        for support in self.supports:
+            pos = support['position']
+            stype = support['type']
+            
+            if stype == 'fixed':
+                # Основная вертикальная линия
+                ax.vlines(pos, -1.0, 1.0, colors='k', lw=3, zorder=3)
+                
+                # Штриховка с правильными координатами
+                hatch_rect = patches.Rectangle(
+                    (pos - 0.3, -1.0),  # Смещение влево на 0.3 м
+                    0.3,   # Ширина штриховки
+                    2.0,   # Высота штриховки (-1.0 до 1.0)
+                    fill=False,
+                    hatch='||||||',
+                    linewidth=0.8,
+                    edgecolor='#444444',
+                    alpha=0.8,
+                    zorder=2
+                )
+                ax.add_patch(hatch_rect)
+                
+                # Декоративное соединение
+                ax.add_patch(patches.Arc(
+                    (pos, 0), 
+                    width=0.25, 
+                    height=0.25,
+                    angle=90,
+                    theta1=270,
+                    theta2=360,
+                    color='k',
+                    lw=2,
+                    zorder=4
+                ))
+                
+                legend_elements.append(patches.Patch(
+                    edgecolor='#444444',
+                    hatch='||||||',
+                    label='Заделка',
+                    alpha=0.8,
+                    linewidth=0.8
+                ))
+                
+            elif stype == 'fixed_support':
+                ax.plot(pos, 0, 'r^', markersize=15, markeredgecolor='black')
+                legend_elements.append(plt.Line2D([0], [0], marker='^', color='r', 
+                                label='Неподвижная опора', markersize=10))
+                    
+            elif stype == 'roller':
+                ax.plot(pos, 0, 'b>', markersize=15, markeredgecolor='black')
+                legend_elements.append(plt.Line2D([0], [0], marker='>', color='b',
+                                label='Подвижная опора', markersize=10))
+
+        # Отрисовка реакций
+        reaction_y = 2.5
+        for key, value in self.reactions.items():
+            unit = "Н·м" if key.startswith('M') else "Н"
+            color = 'red' if 'M' in key else 'blue'
+            label = f"{key} = {abs(value):.1f} {unit}"
+            
+            ax.text(0.02, reaction_y, label,
+                    transform=ax.transAxes,
+                    color=color,
+                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.8),
+                    fontsize=9)
+            reaction_y -= 0.18
+
+        # Отрисовка нагрузок
+        for load in self.loads:
+            if load.type == 'force':
+                self._draw_force(ax, load)
+                # Добавляем направление в легенду
+                direction = '↑' if load.direction == 'up' else '↓'
+                legend_elements.append(plt.Line2D([0], [0], color='green' if load.direction=='up' else 'red',
+                                lw=2, label=f'Сила: {load.value} Н {direction}'))
+            
+            elif load.type == 'distributed':
+                self._draw_distributed(ax, load)
+                # Добавляем направление в легенду
+                direction = '↓' if load.direction == 'down' else '↑'
+                legend_elements.append(patches.Patch(facecolor='orange', edgecolor='none',
+                                alpha=0.5, label=f'Распред.: {load.value} Н/м {direction}'))
+            
+            elif load.type == 'moment':
+                self._draw_moment(ax, load)
+                # Добавляем направление в легенду
+                direction = '↰' if load.direction == 'ccw' else '↱'
+                legend_elements.append(plt.Line2D([0], [0], color='purple', 
+                                marker='$L$' if load.direction=='ccw' else '$Г$',
+                                markersize=15, label=f'Момент: {load.value} Н·м {direction}'))
+
+        # Модифицируем параметры легенды
+        ax.legend(handles=legend_elements, 
+                loc='upper left',
+                bbox_to_anchor=(1.02, 0.9),  # Увеличиваем отступ
+                framealpha=0.9,
+                fontsize=9,
+                borderaxespad=0.5)  # Добавляем отступ от границ
+
+        ax.axis('off')
+        ax.set_title("Расчетная схема", pad=15, fontsize=12)
+
+    def _draw_force(self, ax, load):
+        direction = 1 if load.direction == 'up' else -1
+        color = 'green' if direction == 1 else 'red'
+        
+        # Основная стрелка
+        ax.arrow(load.position, 0, 0, direction * 1.8, 
+                head_width=0.25, head_length=0.25, 
+                fc=color, ec=color, lw=1.2)
+        
+        # Дополнительная линия для баланса
+        ax.plot([load.position-0.15, load.position+0.15], 
+                [direction*1.8, direction*1.8],
+                color=color, lw=1.5)
+        
+        # Смещаем текст в зависимости от направления
+        text_offset = 3 * direction
+        ax.arrow(load.position, 0, 0, direction * 1.8, 
+                head_width=0.25, head_length=0.25, 
+                fc=color, ec=color, lw=1.2)
+        ax.text(load.position, text_offset, 
+            f'{load.value} Н', 
+            ha='center', va='bottom' if direction == 1 else 'top',
+            color=color, fontsize=9,
+            bbox=dict(facecolor='white', edgecolor='none', alpha=0.8))
+
+    def _draw_distributed(self, ax, load):
+        # Определяем направление и параметры отрисовки
+        if load.direction == 'down':
+            y_base = 1.2  # Над балкой
+            arrow_direction = -1  # Стрелки вниз
+            text_y_offset = 0.5   # Текст над прямоугольником
+        else:
+            y_base = -1.2 # Под балкой
+            arrow_direction = 1   # Стрелки вверх
+            text_y_offset = -0.5  # Текст под прямоугольником
+
+        height = 0.4
+        num_arrows = 6
+
+        # Прямоугольник распределенной нагрузки
+        rect = patches.Rectangle(
+            (load.start, y_base), 
+            load.end - load.start, 
+            height,
+            facecolor='orange', 
+            alpha=0.4, 
+            edgecolor='none'
+        )
+        ax.add_patch(rect)
+
+        # Стрелки нагрузки
+        x_vals = np.linspace(load.start, load.end, num_arrows)
+        for x in x_vals:
+            ax.arrow(
+                x, 
+                y_base + height/2, 
+                0, 
+                arrow_direction * 0.8,
+                head_width=0.15, 
+                head_length=0.15,
+                fc='orange', 
+                ec='orange'
+            )
+
+        # Текст нагрузки
+        ax.text(
+            (load.start + load.end)/2, 
+            y_base + text_y_offset + (height if load.direction == 'up' else 0),
+            f'q = {load.value} Н/м',
+            ha='center', 
+            color='orange', 
+            fontsize=9,
+            bbox=dict(facecolor='white', edgecolor='none', alpha=0.8)
+        )
+
+    def _draw_moment(self, ax, load):
+        size = 0.8
+        rotation = 0
+        
+        # Инвертируем отображение направления
+        if load.direction == 'ccw':
+            symbol = '↰'  # Против часовой - стрелка влево
+            text_offset = -0.6
+        else:
+            symbol = '↱'  # По часовой - стрелка вправо
+            text_offset = 0.6
+
+        # Символ момента
+        ax.text(load.position, 0, 
+            symbol,
+            fontsize=24, 
+            color='purple',
+            ha='center', 
+            va='center',
+            rotation=rotation)
+        
+        # Текст момента
+        ax.text(load.position + text_offset, 0.4,
+            f'M = {load.value} Н·м',
+            color='purple', 
+            fontsize=9,
+            ha='left' if load.direction == 'ccw' else 'right',
+            bbox=dict(facecolor='white', edgecolor='none', alpha=0.8))
+
+    def _plot_force_diagram(self, ax):
+        x = np.linspace(0, self.length, 1000)
+        Q = [self.compute_internal_forces(xi)[0] for xi in x]
+        Q_max = max(abs(q) for q in Q) if Q else 1
+        ax.set_xlim(0, self.length)
+        # Построение эпюры
+        hatch_style = {'hatch': '||||', 'linewidth': 0.3, 'alpha': 0.7}
+        ax.fill_between(x, Q, 0, where=np.array(Q)>=0, facecolor='none', edgecolor='blue', **hatch_style)
+        ax.fill_between(x, Q, 0, where=np.array(Q)<0, facecolor='none', edgecolor='red', **hatch_style)
+        ax.plot(x, Q, 'b-', lw=1.2)
+        
+        # Подписи скачков
+        for point in self._get_critical_points():
+            if point[0] != 'Q':
+                continue
+                
+            x_point, Q_left, Q_right = point[1], point[2], point[3]
+            offset = 0.07 * Q_max
+            
+            # Левое значение
+            ax.annotate(f"{Q_left:.1f}",
+                xy=(x_point, Q_left),
+                xytext=(x_point - 0.15, Q_left + (offset if Q_left >=0 else -offset)),
+                arrowprops=dict(arrowstyle="-|>", lw=0.8, color='#333333', relpos=(0.5, 0.5)),
+                ha='right',
+                va='bottom' if Q_left >=0 else 'top',
+                fontsize=8,
+                bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none', alpha=0.9))
+            
+            # Правое значение
+            ax.annotate(f"{Q_right:.1f}",
+                xy=(x_point, Q_right),
+                xytext=(x_point + 0.15, Q_right + (offset if Q_right >=0 else -offset)),
+                arrowprops=dict(arrowstyle="-|>", lw=0.8, color='#333333', relpos=(0.5, 0.5)),
+                ha='left',
+                va='bottom' if Q_right >=0 else 'top',
+                fontsize=8,
+                bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none', alpha=0.9))
+
+        ax.grid(True, linestyle=':', alpha=0.5)
+        ax.axhline(0, color='black', lw=0.8)
+        ax.set_title("Эпюра поперечных сил (Q)", pad=20)  # Увеличим отступ заголовка
+
+        # Обработка всех ключевых точек
+        processed = set()
+        for x_point in self.get_key_points():
+            if x_point in processed:
+                continue
+
+            # Проверка на скачок
+            is_jump = any(p[1] == x_point and p[0] == 'Q_jump' 
+                        for p in self._get_critical_points())
+            Q_val = self.compute_internal_forces(x_point)[0]
+            y_offset = 0.1 * (ax.get_ylim()[1] - ax.get_ylim()[0])
+
+            if is_jump:
+                # Получаем значения слева и справа
+                Q_left = self.compute_internal_forces(x_point - 1e-6)[0]
+                Q_right = self.compute_internal_forces(x_point + 1e-6)[0]
+                
+                # Левая подпись
+                ax.annotate(f"{Q_left:.1f}",
+                        xy=(x_point, Q_left),
+                        xytext=(x_point - 0.1, Q_left + y_offset),
+                        ha='right', va='bottom' if Q_left >=0 else 'top',
+                        fontsize=8, bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none'))
+                
+                # Правая подпись
+                ax.annotate(f"{Q_right:.1f}",
+                        xy=(x_point, Q_right),
+                        xytext=(x_point + 0.1, Q_right - y_offset),
+                        ha='left', va='top' if Q_right >=0 else 'bottom',
+                        fontsize=8, bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none'))
+            else:
+                # Подпись единого значения
+                ax.annotate(f"{Q_val:.1f}",
+                        xy=(x_point, Q_val),
+                        xytext=(x_point, Q_val + (y_offset if Q_val >=0 else -y_offset)),
+                        ha='center', va='bottom' if Q_val >=0 else 'top',
+                        fontsize=8, bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none'))
+
+            processed.add(x_point)
+
+        # Перенос заголовка
+        ax.set_title("Q [Н]", loc='right', pad=15, y=0.85, fontsize=10, color='#1E3F5A')
+
+    def _plot_moment_diagram(self, ax):
+        x = np.linspace(0, self.length, 1000)
+        M = [self.compute_internal_forces(xi)[1] for xi in x]
+        M_max = max(abs(m) for m in M) if M else 1
+        ax.set_xlim(0, self.length)
+        # Построение эпюры
+        hatch_style = {'hatch': '||||', 'linewidth': 0.4, 'alpha': 0.8}
+        ax.fill_between(x, M, 0, where=np.array(M)>=0, facecolor='none', edgecolor='#FF4500', **hatch_style)
+        ax.fill_between(x, M, 0, where=np.array(M)<0, facecolor='none', edgecolor='#1E90FF', **hatch_style)
+        ax.plot(x, M, '#8B0000', lw=1.2)
+        
+        # Подписи только для скачков
+        for point in self._get_critical_points():
+            if point[0] != 'M_jump':
+                continue
+                
+            x_point, M_left, M_right = point[1], point[2], point[3]
+            offset = 0.1 * M_max
+            
+            # Левое значение
+            ax.annotate(f"{M_left:.1f}",
+                xy=(x_point, M_left),
+                xytext=(x_point - 0.2, M_left + (offset if M_left >=0 else -offset)),
+                arrowprops=dict(arrowstyle="-|>", lw=0.8, color='#333333'),
+                ha='right',
+                va='bottom' if M_left >=0 else 'top',
+                fontsize=8,
+                bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none', alpha=0.9))
+            
+            # Правое значение
+            ax.annotate(f"{M_right:.1f}",
+                xy=(x_point, M_right),
+                xytext=(x_point + 0.2, M_right + (offset if M_right >=0 else -offset)),
+                arrowprops=dict(arrowstyle="-|>", lw=0.8, color='#333333'),
+                ha='left',
+                va='bottom' if M_right >=0 else 'top',
+                fontsize=8,
+                bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none', alpha=0.9))
+
+        ax.grid(True, linestyle=':', alpha=0.5)
+        ax.axhline(0, color='black', lw=0.8)
+        ax.set_title("Эпюра изгибающих моментов (M)", pad=20)
+
+        # Обработка подписей с проверкой на скачки
+        processed = set()
+        for x_point in self.get_key_points():
+            if x_point in processed:
+                continue
+
+            is_jump = any(p[1] == x_point and p[0] == 'M_jump' 
+                        for p in self._get_critical_points())
+            M_val = self.compute_internal_forces(x_point)[1]
+            y_offset = 0.1 * (ax.get_ylim()[1] - ax.get_ylim()[0])
+
+            if is_jump:
+                M_left = self.compute_internal_forces(x_point - 1e-6)[1]
+                M_right = self.compute_internal_forces(x_point + 1e-6)[1]
+                
+                ax.annotate(f"{M_left:.1f}",
+                        xy=(x_point, M_left),
+                        xytext=(x_point - 0.15, M_left + y_offset),
+                        ha='right', va='bottom' if M_left >=0 else 'top',
+                        fontsize=8, bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none'))
+                
+                ax.annotate(f"{M_right:.1f}",
+                        xy=(x_point, M_right),
+                        xytext=(x_point + 0.15, M_right - y_offset),
+                        ha='left', va='top' if M_right >=0 else 'bottom',
+                        fontsize=8, bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none'))
+            else:
+                ax.annotate(f"{M_val:.1f}",
+                        xy=(x_point, M_val),
+                        xytext=(x_point, M_val + (y_offset if M_val >=0 else -y_offset)),
+                        ha='center', va='bottom' if M_val >=0 else 'top',
+                        fontsize=8, bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none'))
+
+            processed.add(x_point)
+
+        ax.set_title("M [Н·м]", loc='right', pad=15, y=0.85, fontsize=10, color='#8B0000')
+        
+    def _plot_theta_diagram(self, ax):
+        x, theta, _ = self.calculate_deflections()
+        ax.plot(x, theta, 'g-', lw=1.5)
+        ax.set_title("Эпюра углов поворота" + 
+                    (" (EIθ)" if self.E is None or self.I is None else " θ [рад]"))
+        ax.grid(True)
+        self._add_segment_lines(ax)
+
+    def _plot_w_diagram(self, ax):
+        x, _, w = self.calculate_deflections()
+        ax.plot(x, w, 'm-', lw=1.5)
+        ax.set_title("Эпюра прогибов" + 
+                    (" (EIw)" if self.E is None or self.I is None else " w [м]"))
+        ax.grid(True)
+        self._add_segment_lines(ax)
+
+    def _add_segment_lines(self, ax):
+        # Вертикальные линии для сегментов
+        for seg in self.segments:
+            ax.axvline(seg[0], color='gray', linestyle=':', alpha=0.5)
+        ax.axvline(self.length, color='gray', linestyle=':', alpha=0.5)
+
+    def get_key_points(self):
+        points = set()
+        
+        # Точки приложения нагрузок
+        for load in self.loads:
+            if load.type == 'force':
+                points.add(load.position)
+            elif load.type == 'distributed':
+                points.add(load.start)
+                points.add(load.end)
+            elif load.type == 'moment':
+                points.add(load.position)
+        
+        # Опорные точки
+        points.update(s['position'] for s in self.supports)
+        
+        # Границы балки
+        points.add(0.0)
+        points.add(self.length)
+        
+        return sorted(points)
+
+    def calculate_section_results(self):
+        points = self.get_key_points()
+        results = []
+        
+        # Расчет в ключевых точках
+        for x in points:
+            Q, M = self.compute_internal_forces(x)
+            results.append({
+                'x': x,
+                'Q': Q,
+                'M': M
+            })
+        
+        # Расчет деформаций
+        x_full, theta, w = self.calculate_deflections()
+        
+        # Интерполяция деформаций в ключевых точках
+        for res in results:
+            idx = np.abs(x_full - res['x']).argmin()
+            res['theta'] = theta[idx]
+            res['w'] = w[idx]
+        
+        return results
+
+    def get_max_moment(self):
+        results = self.calculate_section_results()
+        max_m = max(abs(res['M']) for res in results)
+        return max_m
+
+    def print_results_table(self, sigma_allow=None):
+        results = self.calculate_section_results()
+        
+        headers = ["Точка, м", "Q, Н", "M, Н·м", 
+                "θ" + (" [рад]" if self.E and self.I else " (EIθ)"), 
+                "w" + (" [м]" if self.E and self.I else " (EIw)")]
+        
+        table = []
+        required_W = 0  # Инициализируем переменную
+        
+        if sigma_allow is not None and sigma_allow != 0:
+            max_moment = max(abs(res['M']) for res in results)
+            required_W = max_moment / sigma_allow
+            headers.append("σ, Па")
+
+        for i, res in enumerate(results):
+            theta_label = f"{res['theta']:.4e}"
+            w_label = f"{res['w']:.4e}"
+            if not (self.E and self.I):
+                theta_label += " EIθ"
+                w_label += " EIw"
+            
+            row = [
+                f"{res['x']:.3f}",
+                f"{res['Q']:.2f}",
+                f"{res['M']:.2f}",
+                theta_label,
+                w_label
+            ]
+            
+            if sigma_allow is not None and sigma_allow != 0:
+                sigma = abs(res['M']) / required_W if required_W != 0 else 0
+                row.append(f"{sigma:.2f}")
+            
+            table.append(row)
+
+        print("\nРезультаты в характерных точках:")
+        print(tabulate(table, headers=headers, tablefmt="grid"))
+
+class BeamSolutionViewer:
+    def __init__(self, beam):
+        self.beam = beam
+        self.root = tk.Tk()
+        self.root.title("Процесс расчета балки")
+        self.root.geometry("1400x900")
+        
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill='both', expand=True)
+        
+        self.create_reactions_tab()
+        self.create_segments_tabs()
+        self.create_deflections_tab()
+        self.create_plots_tab()
+        
+    def create_reactions_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="1. Реакции опор")
+        
+        text = tk.Text(tab, wrap=tk.WORD, font=('Arial', 12))
+        scroll = tk.Scrollbar(tab, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        text.pack(fill='both', expand=True)      
+        text.insert(tk.END, self.format_reactions_solution())
+        text.insert(tk.END, self.format_strength_solution())  
+        text.configure(state='disabled')
+    
+    def format_strength_solution(self):
+        if hasattr(self.beam, 'required_W'):
+            # Форматируем в зависимости от величины
+            if abs(self.beam.required_W) < 0.001 or abs(self.beam.required_W) >= 1e6:
+                w_format = f"{self.beam.required_W:.4e}"
+            else:
+                w_format = f"{self.beam.required_W:.6f}"
+            
+            text = (f"\n\n=== Прочностной расчет ===\n"
+                    f"Максимальный изгибающий момент: {self.beam.max_moment:.2f} Н·м\n"
+                    f"Допускаемое напряжение: {self.beam.sigma_allow:.2e} Па\n"
+                    f"Требуемый момент сопротивления сечения: {w_format} м³\n")
+            return text
+        return ""
+    
+    def format_reactions_solution(self):
+        text = "=== Расчет реакций опор ===\n\n"
+        n = self.beam.degree_of_indeterminacy()
+        
+        text += f"Степень статической неопределимости: n = {n}\n"
+        
+        if n == 0:
+            text += self._format_statically_determinate()
+        elif n == 1:
+            text += self._format_first_order_indeterminate()
+        elif n == 2:
+            text += self._format_second_order_indeterminate()
+        
+        text += "\nИтоговые реакции:\n"
+        for name, value in self.beam.reactions.items():
+            unit = "Н" if name.startswith('R') else "Н·м"
+            text += f"{name} = {value:.2f} {unit}\n"
+        return text
+
+    def _format_statically_determinate(self):
+        text = "\nСтатически определимая система:\n"
+        
+        # Случай 1: Одна заделка
+        if len(self.beam.supports) == 1 and self.beam.supports[0]['type'] == 'fixed':
+            text += self._format_case_fixed_support()
+        
+        # Случай 2: Две опоры
+        elif len(self.beam.supports) == 2:
+            text += self._format_case_two_supports()
+        
+        return text
+
+    def _format_case_fixed_support(self):
+        support = self.beam.supports[0]
+        text = f"\nЗаделка в точке x = {support['position']:.2f} м\n"
+        text += "Уравнения равновесия:\n"
+        text += "1. ΣFy = 0: R + ΣF_i = 0\n"
+        text += "2. ΣM = 0: M + ΣM_i + ΣF_i·(x_i - x_опоры) = 0\n\n"
+        
+        sum_F = 0
+        sum_M = 0
+        for load in self.beam.loads:
+            if load.type == 'force':
+                F = load.value * (-1 if load.direction == 'down' else 1)
+                arm = load.position - support['position']
+                sum_F += F
+                sum_M += F * arm
+                text += f"   Сила F={F:.2f} Н на x={load.position:.2f} м: "
+                text += f"Плечо = {arm:.2f} м, Момент = {F*arm:.2f} Н·м\n"
+            
+            elif load.type == 'distributed':
+                q = load.value * (-1 if load.direction == 'down' else 1)
+                L = load.end - load.start
+                F = q * L
+                centroid = (load.start + load.end)/2
+                arm = centroid - support['position']
+                sum_F += F
+                sum_M += F * arm
+                text += f"   Распред. нагрузка q={q:.2f} Н/м: "
+                text += f"Эквив. сила F={F:.2f} Н, Плечо = {arm:.2f} м, Момент = {F*arm:.2f} Н·м\n"
+            
+            elif load.type == 'moment':
+                M = load.value * (1 if load.direction == 'ccw' else -1)
+                sum_M += M
+                text += f"   Момент M={M:.2f} Н·м на x={load.position:.2f} м\n"
+        
+        text += f"\nСуммарные усилия:\nΣF = {sum_F:.2f} Н\nΣM = {sum_M:.2f} Н·м\n"
+        text += f"Реакции заделки:\nR = {-sum_F:.2f} Н\nM = {-sum_M:.2f} Н·м\n"
+        return text
+
+    def _format_case_two_supports(self):
+        sup1, sup2 = sorted(self.beam.supports, key=lambda s: s['position'])
+        text = f"\nОпоры в x1={sup1['position']:.2f} м и x2={sup2['position']:.2f} м\n"
+        text += "Уравнения равновесия:\n"
+        text += "1. ΣFy = 0: R1 + R2 + ΣF_i = 0\n"
+        text += "2. ΣM = 0: R2·(x2-x1) + ΣM_i + ΣF_i·(x_i-x1) = 0\n\n"
+        
+        sum_F = 0
+        sum_M = 0
+        for load in self.beam.loads:
+            if load.type == 'force':
+                F = load.value * (-1 if load.direction == 'down' else 1)
+                arm = load.position - sup1['position']
+                sum_F += F
+                sum_M += F * arm
+                text += f"   Сила F={F:.2f} Н на x={load.position:.2f} м: "
+                text += f"Плечо = {arm:.2f} м, Момент = {F*arm:.2f} Н·м\n"
+            
+            elif load.type == 'distributed':
+                q = load.value * (-1 if load.direction == 'down' else 1)
+                L = load.end - load.start
+                F = q * L
+                centroid = (load.start + load.end)/2
+                arm = centroid - sup1['position']
+                sum_F += F
+                sum_M += F * arm
+                text += f"   Распред. нагрузка q={q:.2f} Н/м: "
+                text += f"Эквив. сила F={F:.2f} Н, Плечо = {arm:.2f} м, Момент = {F*arm:.2f} Н·м\n"
+            
+            elif load.type == 'moment':
+                M = load.value * (1 if load.direction == 'ccw' else -1)
+                sum_M += M
+                text += f"   Момент M={M:.2f} Н·м на x={load.position:.2f} м\n"
+        
+        delta_x = sup2['position'] - sup1['position']
+        R2 = -sum_M / delta_x
+        R1 = -sum_F - R2
+        
+        text += f"\nСуммарные усилия:\nΣF = {sum_F:.2f} Н\nΣM = {sum_M:.2f} Н·м\n"
+        text += f"Решение системы:\n"
+        text += f"R2 = -ΣM / (x2 - x1) = -{sum_M:.2f} / {delta_x:.2f} = {R2:.2f} Н\n"
+        text += f"R1 = -ΣF - R2 = -{sum_F:.2f} - {R2:.2f} = {R1:.2f} Н\n"
+        return text
+
+
+    def _get_unit_deflection(self, pos):
+        """Вычисляет прогиб от единичной силы с учетом направления"""
+        unit_beam = Beam(self.beam.length, [self.beam.supports[0]], self.beam.E, self.beam.I)
+        unit_beam.add_load(Load('force', 1.0, pos, direction='up'))  # Направление вверх
+        unit_beam.calculate_reactions()
+        return unit_beam.compute_deflection_at(pos)
+    
+    def _format_first_order_indeterminate(self):
+        text = "\nСистема 1 раз статически неопределима\nМетод сил:\n"
+        text += "1. Выбираем основную систему\n"
+        text += "2. Строим уравнения совместности деформаций\n"
+        text += "3. Решаем систему уравнений\n"
+
+        if len(self.beam.supports) == 2 and self.beam.supports[1]['type'] == 'roller':
+            removed_support = self.beam.supports[1]
+            pos = removed_support['position']
+            
+            # Основная система
+            main_beam = Beam(self.beam.length, [self.beam.supports[0]], self.beam.E, self.beam.I)
+            main_beam.loads = self.beam.loads.copy()
+            main_beam.calculate_reactions()
+            
+            delta_p = main_beam.compute_deflection_at(pos)
+            delta_1 = self._get_unit_deflection(pos)
+            
+            # Проверка на нулевой delta_1
+            if abs(delta_1) < 1e-10:
+                raise ValueError("Невозможно решить: единичная нагрузка не вызывает прогиба в опоре")
+            
+            X = -delta_p / delta_1
+            
+            text += (
+                f"Основная система: удалена опора при x={pos:.2f} м\n"
+                f"Прогиб от внешних нагрузок: δ_p = {delta_p:.4e} м\n"
+                f"Прогиб от единичной силы: δ_1 = {delta_1:.4e} м/Н\n"
+                f"Реакция опоры: X = -δ_p / δ_1 = {X:.2f} Н\n"
+            )
+        
+        return text
+
+    def _format_second_order_indeterminate(self):
+        text = "\nСистема 2 раза статически неопределима\n"
+        text += "Метод сил с двумя неизвестными:\n"
+        
+        if any(s['type'] == 'fixed' for s in self.beam.supports):
+            rollers = [s for s in self.beam.supports if s['type'] == 'roller']
+            text += f"Удалены опоры в x={rollers[0]['position']:.2f} м и x={rollers[1]['position']:.2f} м\n"
+            text += f"Реакции: R1 = {self.beam.reactions['R_roller1']:.2f} Н, R2 = {self.beam.reactions['R_roller2']:.2f} Н\n"
+        
+        return text
+
+    def create_segments_tabs(self):
+        self.beam._update_segments()
+        
+        # Фильтруем сегменты с длиной менее 1 мм
+        meaningful_segments = [
+            seg for seg in self.beam.segments
+            if seg[1] - seg[0] >= 0.001  # 1 мм минимальная длина
+        ]
+        
+        for i, segment in enumerate(meaningful_segments):
+            tab = ttk.Frame(self.notebook)
+            self.notebook.add(tab, text=f"2.{i+1} Участок {i+1}")
+            
+            text = tk.Text(tab, wrap=tk.WORD, font=('Courier New', 12))
+            scroll = tk.Scrollbar(tab, command=text.yview)
+            text.configure(yscrollcommand=scroll.set)
+            
+            text.tag_configure('formula', foreground='blue')
+            text.tag_configure('value', foreground='green')
+            
+            scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            text.pack(fill='both', expand=True)
+            
+            self.add_segment_solution(text, segment)
+            text.configure(state='disabled')
+    
+    def add_segment_solution(self, text_widget, segment):
+        x0, x1 = segment
+        text_widget.insert(tk.END, f"Участок от x = {x0:.2f} м до x = {x1:.2f} м\n\n")
+        
+        Q0, M0 = self.beam.compute_internal_forces(x0)
+        Q1, M1 = self.beam.compute_internal_forces(x1)
+        
+        # Форматирование формул
+        text_widget.insert(tk.END, "Поперечная сила Q(x):\n")
+        text_widget.insert(tk.END, f"Q(x₀) = {Q0:.2f} Н\n", 'value')
+        text_widget.insert(tk.END, f"Q(x₁) = {Q1:.2f} Н\n\n", 'value')
+        
+        text_widget.insert(tk.END, "Изгибающий момент M(x):\n")
+        text_widget.insert(tk.END, f"M(x₀) = {M0:.2f} Н·м\n", 'value')
+        text_widget.insert(tk.END, f"M(x₁) = {M1:.2f} Н·м\n\n", 'value')
+        
+        # Анализ нагрузок
+        for load in self.beam.loads:
+            if self.load_affects_segment(load, segment):
+                if load.type == 'distributed':
+                    q = load.value * (-1 if load.direction == 'down' else 1)
+                    a = max(load.start, x0)
+                    b = min(load.end, x1)
+                    text_widget.insert(tk.END, f"Распределенная нагрузка q={q:.2f} Н/м на [{a:.2f}, {b:.2f}]\n")
+                    text_widget.insert(tk.END, f"Q(x) = {Q0:.2f} + {q:.2f}*(x - {a:.2f})\n")
+                    text_widget.insert(tk.END, f"M(x) = {M0:.2f} + {Q0:.2f}*(x - {x0:.2f}) + {q/2:.2f}*(x - {a:.2f})^2\n\n")
+                
+                elif load.type == 'force' and x0 <= load.position <= x1:
+                    F = load.value * (-1 if load.direction == 'down' else 1)
+                    text_widget.insert(tk.END, f"Сосредоточенная сила F={F:.2f} Н при x={load.position:.2f} м\n")
+                    text_widget.insert(tk.END, f"Скачок Q: ΔQ = {-F:.2f} Н\n")
+                    text_widget.insert(tk.END, f"Излом M: ΔM = {-F*(load.position - x0):.2f} Н·м\n\n")
+
+    def load_affects_segment(self, load, segment):
+        x0, x1 = segment
+        if load.type == 'force':
+            return x0 <= load.position <= x1
+        elif load.type == 'distributed':
+            return not (load.end <= x0 or load.start >= x1)
+        return False
+
+    def create_deflections_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="3. Деформации")
+        
+        text = tk.Text(tab, wrap=tk.WORD, font=('Arial', 12))
+        scroll = tk.Scrollbar(tab, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        
+        text.pack(fill='both', expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        text.insert(tk.END, self.format_deflections_solution())
+        text.configure(state='disabled')
+    
+    def format_deflections_solution(self):
+        text = "=== Расчет деформаций ===\n\n"
+        text += "Метод двойного интегрирования:\n"
+        text += "1. θ(x) = θ₀ + ∫(M(x)/EI)dx\n"
+        text += "2. w(x) = w₀ + ∫θ(x)dx\n\n"
+        
+        if self.beam.E and self.beam.I:
+            text += f"Жесткость сечения EI = {self.beam.E*self.beam.I:.2e} Н·м²\n"
+        else:
+            text += "Жесткость сечения не задана (расчет в EI)\n"
+        
+        text += "\nГраничные условия:\n"
+        for s in self.beam.supports:
+            if s['type'] == 'fixed':
+                text += f"x={s['position']:.2f} м: w=0, θ=0\n"
+            else:
+                text += f"x={s['position']:.2f} м: w=0\n"
+        
+        return text
+
+    def create_plots_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="4. Графики")
+        
+        fig = self.beam.plot_diagrams()
+        canvas = FigureCanvasTkAgg(fig, master=tab)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+    
+    def show(self):
+        self.root.mainloop()
+
+class Bar:
+    class Segment:
+        def __init__(self, start, length, area):
+            self.start = start
+            self.length = length
+            self.area = area
+            self.end = start + length
+
+    def __init__(self, E, allowable_sigma, support_type='fixed_left'):
+        self.E = E
+        self.allowable_sigma = allowable_sigma
+        self.support_type = support_type
+        self.segments = []
+        self.forces = []
+        self.reactions = {}
+
+    def add_segment(self, length, area):
+        start = self.segments[-1].end if self.segments else 0
+        self.segments.append(self.Segment(start, length, area))
+
+    def add_force(self, position, value):
+        self.forces.append({'pos': position, 'value': value})
+
+    def total_length(self):
+        return self.segments[-1].end if self.segments else 0
+
+    def find_segment(self, x):
+        for seg in self.segments:
+            if seg.start <= x < seg.end:
+                return seg
+        return self.segments[-1]
+    
+    def calculate_reactions(self):
+        """Расчёт реакции R₂ для двух заделок методом сил"""
+        if self.support_type == 'fixed_both':
+            total_length = self.total_length()
+            
+            # 1. Рассчитываем продольные силы на участках без учёта R₂
+            #    (проходим справа налево, R₂ = 0)
+            points = sorted({
+                f['pos'] for f in self.forces
+            } | {
+                seg.end for seg in self.segments
+            } | {0, total_length}, 
+            reverse=True)
+            
+            N_values = {}  # Словарь: (x_start, x_end) -> N
+            current_force = 0
+            for i in range(len(points)-1):
+                x_end = points[i]
+                x_start = points[i+1]
+                
+                # Сумма сил в точке x_end (справа от сечения)
+                applied = sum(f['value'] for f in self.forces if abs(f['pos'] - x_end) < 1e-9)
+                current_force += applied
+                N_values[(x_start, x_end)] = current_force
+            
+            # 2. Вычисляем удлинение от внешних сил
+            delta_F = 0.0
+            for (x_start, x_end), N in N_values.items():
+                seg = self.find_segment(x_start)
+                delta_F += N * (x_end - x_start) / (self.E * seg.area)
+            
+            # 3. Суммарная податливость
+            compliance = sum(seg.length / (self.E * seg.area) for seg in self.segments)
+            
+            # 4. Реакция R₂
+            self.reactions['R2'] = -delta_F / compliance
+
+    def build_internal_force_distribution(self):
+        if self.support_type == 'fixed_both':
+            self.calculate_reactions()
+            # Добавляем реакцию R2 как силу в конце бруса
+            adjusted_forces = self.forces + [{'pos': self.total_length(), 'value': self.reactions['R2']}]
+        else:
+            adjusted_forces = self.forces.copy()
+
+        # Характерные точки (включая концы сегментов и точки приложения сил)
+        points = sorted({
+            f['pos'] for f in adjusted_forces
+        } | {
+            seg.end for seg in self.segments
+        } | {0, self.total_length()}, 
+        reverse=True)
+
+        forces = []
+        current_force = 0.0
+        
+        # Расчет внутренних усилий СПРАВА НАЛЕВО
+        for i in range(len(points)-1):
+            x_end = points[i]
+            x_start = points[i+1]
+            
+            # Суммируем силы в точке x_end (справа от сечения)
+            applied = sum(f['value'] for f in adjusted_forces if abs(f['pos'] - x_end) < 1e-9)
+            current_force += applied  # Учитываем знаки!
+            
+            forces.append((x_start, x_end, current_force))
+
+        # Переворачиваем результат для отображения слева направо
+        return list(reversed(forces))
+    
+    def calculate(self):
+        force_diagram = self.build_internal_force_distribution()
+        stresses = []
+        displacements = [0]
+        dx = 0.01
+        u = 0
+
+        for x_start, x_end, N in force_diagram:
+            # Убедимся, что x_start < x_end
+            if x_start > x_end:
+                x_start, x_end = x_end, x_start  # Меняем местами
+            
+            # Вычисляем количество точек
+            num_points = int((x_end - x_start) / dx) + 1  # +1 чтобы избежать нуля
+            x_vals = np.linspace(x_start, x_end, num_points)
+            
+            for x in x_vals:
+                seg = self.find_segment(x)
+                sigma = N / seg.area
+                stresses.append(sigma)
+                du = N * dx / (self.E * seg.area)
+                u += du
+                displacements.append(u*1e6)
+
+        # Коррекция перемещений для двух заделок
+        if self.support_type == 'fixed_both':
+            total_length = self.total_length()
+            slope = displacements[-1] / total_length
+            x_points = np.linspace(0, total_length, len(displacements))
+            displacements = [u - slope * x for x, u in zip(x_points, displacements)]
+
+        return force_diagram, stresses, displacements
+
+    def check_strength(self, force_diagram):
+        results = []
+        for x_start, x_end, N in force_diagram:
+            # Находим сегмент, соответствующий участку [x_start, x_end]
+            seg = None
+            for segment in self.segments:
+                if segment.start <= x_start and x_end <= segment.end:
+                    seg = segment
+                    break
+            if not seg:
+                raise ValueError(f"Не найден сегмент для участка {x_start}-{x_end}")
+
+            # Вычисляем напряжение с учетом знака
+            sigma = N / seg.area  # Убираем abs(), чтобы видеть тип деформации
+            ok = abs(sigma) <= self.allowable_sigma  # Проверяем по модулю
+
+            results.append((x_start, x_end, N, sigma, ok))
+        
+        return results
+
+    def plot(self, force_diagram, stresses, displacements):
+        fig, axs = plt.subplots(4, 1, figsize=(16, 12), sharex=True)
+        plt.subplots_adjust(hspace=0.3)
+
+        # Инициализируем base_height даже при отсутствии сегментов
+        max_area = max(seg.area for seg in self.segments) if self.segments else 1
+        min_area = min(seg.area for seg in self.segments) if self.segments else 1
+        base_height = 0.5  # Добавляем инициализацию по умолчанию
+        
+        if self.segments:
+            base_height = 0.5 * (max_area / max_area) if max_area != 0 else 0.5
+        
+        # Отрисовка левой заделки
+        axs[0].add_patch(plt.Rectangle(
+            (-0.2, -base_height/2), 
+            0.2, base_height,
+            color='#2F4F4F', zorder=3
+        ))
+
+        # Отрисовка правой заделки если нужно
+        if self.support_type == 'fixed_both':
+            axs[0].add_patch(plt.Rectangle(
+                (self.total_length(), -base_height/2), 
+                0.2, base_height,
+                color='#2F4F4F', zorder=3
+            ))
+        
+        # Опора
+        axs[0].add_patch(plt.Rectangle(
+            (-0.2, -base_height/2), 
+            0.2, base_height,
+            color='#2F4F4F', zorder=3
+        ))
+
+        # Сегменты бруса с масштабированием по площади
+        for seg in self.segments:
+            # Масштабируем высоту относительно максимальной площади
+            height = base_height * (seg.area / max_area) if max_area != 0 else base_height
+            y_bottom = -height/2  # Центрируем по вертикали
+            
+            axs[0].add_patch(plt.Rectangle(
+                (seg.start, y_bottom), 
+                seg.length, height,
+                facecolor='#F5F5F5', edgecolor='black', lw=1.2,
+                label=f'A={seg.area:.2e} м²'
+            ))
+
+        # Силы
+        for f in self.forces:
+            dir = 1 if f['value'] > 0 else -1
+            axs[0].annotate(
+                f"{abs(f['value'])} Н", 
+                xy=(f['pos'], 0), 
+                xytext=(dir*0.5, 0),
+                textcoords='offset points',
+                arrowprops=dict(
+                    arrowstyle='->', 
+                    color='red', 
+                    lw=1.5,
+                    mutation_scale=20
+                ),
+                ha='right' if dir > 0 else 'left', 
+                va='center'
+            )
+
+        # Настройки оси
+        axs[0].set_xlim(-0.5, self.total_length()+0.5)
+        axs[0].set_ylim(-base_height*1.5, base_height*1.5)
+        axs[0].axis('off')
+
+        # ========== Эпюра продольных сил ==========
+        axs[1].set_title("Эпюра продольных сил", pad=15)
+        axs[1].set_ylabel("N, Н")
+        
+        # Строим ступенчатую эпюру
+        x_n = []
+        N_n = []
+        for x_start, x_end, N in force_diagram:
+            x_n.extend([x_start, x_end])
+            N_n.extend([N, N])
+        
+        # Используем step для ступенчатого графика
+        axs[1].step(x_n, N_n, where='post', color='r', lw=2)
+        axs[1].fill_between(x_n, N_n, step='post', alpha=0.4, color='#FFA07A')
+        axs[1].plot(x_n, N_n, 'r-', lw=2)
+        
+        for x_start, x_end, N in force_diagram:
+            if N != 0:
+                axs[1].text(
+                    (x_start + x_end)/2, N/2,
+                    f'{N:.1f} Н',
+                    ha='center', 
+                    va='bottom' if N > 0 else 'top',  # Учет знака
+                    bbox=dict(facecolor='white', edgecolor='none', pad=2)
+                )
+        
+        axs[1].grid(True)
+        axs[1].axhline(0, color='black', lw=1)
+
+        # ========== Эпюра напряжений ==========
+        axs[2].set_title("Эпюра нормальных напряжений", pad=15)
+        axs[2].set_ylabel("σ, Па")
+        
+        x_vals = np.linspace(0, self.total_length(), len(stresses))
+        axs[2].fill_between(x_vals, stresses, color='#98FB98', alpha=0.4)
+        axs[2].plot(x_vals, stresses, 'g-', lw=2)
+        
+        key_points = sorted({0, self.total_length()} | 
+                          {seg.end for seg in self.segments} | 
+                          {f['pos'] for f in self.forces})
+        
+        for x in key_points:
+            idx = np.abs(x_vals - x).argmin()
+            axs[2].annotate(
+                f'{stresses[idx]:.1f}',
+                (x_vals[idx], stresses[idx]),
+                xytext=(0, 10),
+                textcoords='offset points',
+                ha='center', va='bottom',
+                bbox=dict(facecolor='white', edgecolor='none', pad=2),
+                arrowprops=dict(arrowstyle='->', color='green', lw=1)
+            )
+        
+        axs[2].grid(True)
+
+        # ========== Эпюра перемещений ==========
+        axs[3].set_title("Эпюра перемещений", pad=15)
+        axs[3].set_ylabel("Δ, мкм")
+        axs[3].set_xlabel("Длина бруса, м")
+        
+        points = sorted({0, self.total_length()} | 
+                        {seg.end for seg in self.segments} | 
+                        {f['pos'] for f in self.forces})
+        
+        # Интерполяция скорректированных перемещений
+        x_full = np.linspace(0, self.total_length(), len(displacements))
+        disp_points = np.interp(points, x_full, displacements)
+        
+        axs[3].fill_between(points, disp_points, color='#87CEEB', alpha=0.4)
+        axs[3].plot(points, disp_points, 'b-o', lw=2, markersize=6)
+        
+        for x, d in zip(points, disp_points):
+            axs[3].text(
+                x, d, f'{d:.2f}',
+                ha='center', va='bottom',
+                bbox=dict(facecolor='white', edgecolor='none', pad=2))
+        
+        axs[3].grid(True)
+
+        plt.tight_layout()
+        plt.show()
+
+# Ввод с защитой
+
+def float_input(prompt, min_val=None, max_val=None):
+    while True:
+        try:
+            val = float(input(prompt))
+            if (min_val is not None and val < min_val) or (max_val is not None and val > max_val):
+                print("Значение вне допустимого диапазона.")
+                continue
+            return val
+        except ValueError:
+            print("Введите корректное число.")
+
+def int_input(prompt, min_val=None, max_val=None):
+    while True:
+        try:
+            val = int(input(prompt))
+            if (min_val is not None and val < min_val) or (max_val is not None and val > max_val):
+                print("Значение вне допустимого диапазона.")
+                continue
+            return val
+        except ValueError:
+            print("Введите корректное целое число.")
+
+def choice_input(prompt, options, labels):
+    print(prompt)
+    for i, label in enumerate(labels):
+        print(f"{i + 1}. {label}")
+    
+    while True:
+        try:
+            choice = int(input("Выберите вариант: ")) - 1
+            if 0 <= choice < len(options):
+                return options[choice]
+            print("Некорректный выбор!")
+        except ValueError:
+            print("Ошибка: введите номер варианта.")
+
+# ======================== Классы ========================
+class Torque:
+    def __init__(self, position, value):
+        self.position = position
+        self.value = value
+
+class ShaftSegment:
+    def __init__(self, start, length, section_type, d, D=None, t=None):
+        self.start = start
+        self.length = length
+        self.section_type = section_type
+        self.d = d
+        self.D = D
+        self.t = t
+        self.end = start + length
+        self.area = self.calculate_area()
+
+    def polar_moment(self):
+        if self.section_type == 'circle':
+            return (math.pi * self.d**4) / 32
+        elif self.section_type == 'square':
+            return (self.d**4)*0.141
+        elif self.section_type == 'thick_ring':
+            return (math.pi / 32) * (self.D**4 - self.d**4)
+        elif self.section_type == 'thin_ring':
+            return  (math.pi/4) * self.d**3 * self.t
+        else:
+            raise ValueError("Неизвестный тип сечения.")
+        
+    def polar_moment_w(self):
+        if self.section_type == 'circle':
+            return (math.pi * self.d**3) / 16
+        elif self.section_type == 'square':
+            return (self.d**3)*0.208
+        elif self.section_type == 'thick_ring':
+            return (math.pi*self.D**3 / 16) * (1 - (self.d**4/self.D**4))
+        elif self.section_type == 'thin_ring':
+            return  (math.pi/2) * self.d**2 * self.t
+        else:
+            raise ValueError("Неизвестный тип сечения.")
+    
+    def calculate_area(self):
+        """Возвращает площадь сечения в квадратных метрах."""
+        if self.section_type == 'circle':
+            return math.pi * (self.d / 2) ** 2
+        elif self.section_type == 'square':
+            return self.d ** 2
+        elif self.section_type == 'thick_ring':
+            return math.pi * (self.D**2 - self.d**2) / 4
+        elif self.section_type == 'thin_ring':
+            return 2 * math.pi * self.d * self.t
+        else:
+            return 0
+
+class Shaft:
+    def __init__(self, G, allowable_tau, support_type='fixed_left'):
+        self.G = G
+        self.allowable_tau = allowable_tau
+        self.support_type = support_type
+        self.segments = []
+        self.torques = []
+        self.reactions = {}
+        self.integration_steps = 1000
+        self.stress_convergence = 1e-6
+        
+    def add_segment(self, length, section_type, d, D=None, t=None):
+        start = self.segments[-1].end if self.segments else 0
+        self.segments.append(ShaftSegment(start, length, section_type, d, D, t))
+
+    def add_torque(self, position, value):
+        self.torques.append(Torque(position, value))
+
+    def total_length(self):
+        return self.segments[-1].end if self.segments else 0
+
+    def build_internal_torque_distribution(self):
+        if self.support_type == 'fixed_both':
+            self.calculate_reactions()
+            # Добавляем оба реактивных момента
+            adjusted_torques = self.torques + [
+                Torque(0, self.reactions['M_left']),
+                Torque(self.total_length(), self.reactions['M_right'])
+            ]
+        else:
+            adjusted_torques = self.torques.copy()
+        
+        # Остальная часть метода остается без изменений
+        points = sorted({t.position for t in adjusted_torques} |
+                       {seg.end for seg in self.segments} |
+                       {0, self.total_length()}, reverse=True)
+        
+        torques = []
+        current_torque = 0
+        for i in range(len(points)-1):
+            x_start = points[i]
+            x_end = points[i+1]
+            applied = sum(t.value for t in adjusted_torques 
+                         if abs(t.position - x_start) < 1e-9)
+            current_torque += applied
+            torques.append((x_end, x_start, -current_torque))
+        
+        return list(reversed(torques))
+
+    def find_segment(self, x):
+        for seg in self.segments:
+            if seg.start <= x < seg.end:
+                return seg
+        return self.segments[-1]
+    
+    def calculate_reactions(self):
+        if self.support_type == 'fixed_both':
+            L = self.total_length()
+            
+            # Формируем систему уравнений:
+            # 1. ΣT = 0 (M_left + M_right + ΣT_ext = 0)
+            # 2. Угол закручивания φ = 0 на правом конце
+            
+            # Собираем все точки изменения момента и сечения
+            points = sorted({t.position for t in self.torques} | 
+                           {seg.end for seg in self.segments} | 
+                           {0, L})
+            
+            # Вычисляем коэффициенты влияния
+            sum_T = 0
+            sum_phi = 0
+            phi_coeff = 0
+            
+            # Проходим от левого конца к правому
+            for i in range(len(points)-1):
+                x_start = points[i]
+                x_end = points[i+1]
+                dx = x_end - x_start
+                
+                # Моменты на этом участке (без реакций)
+                T_segment = sum(t.value for t in self.torques 
+                               if t.position <= x_start)
+                
+                # Характеристики сечения
+                seg = self.find_segment(x_start)
+                J = seg.polar_moment()
+                
+                sum_T += T_segment * dx / J
+                phi_coeff += dx / J
+            
+            # Система уравнений:
+            # M_left + M_right = -ΣT_ext
+            # M_left*phi_coeff + sum_T = 0
+            
+            total_ext_torque = sum(t.value for t in self.torques)
+            A = np.array([[1, 1], [phi_coeff, 0]])
+            b = np.array([-total_ext_torque, -sum_T])
+            
+            M_left, M_right = np.linalg.solve(A, b)
+            
+            self.reactions = {'M_left': M_left, 'M_right': M_right}
+
+    def calculate(self):
+        torque_diagram = self.build_internal_torque_distribution()
+        stress = []
+        angle = [0]
+        dx = 0.01
+        phi = 0
+        for x_start, x_end, T in torque_diagram:
+            x_vals = np.arange(x_start, x_end, dx)
+            for x in x_vals:
+                seg = self.find_segment(x)
+                J = seg.polar_moment()
+                W = seg.polar_moment_w()
+                tau = T / W
+                stress.append(tau)
+                dphi = T * dx / (J * self.G)
+                phi += dphi
+                angle.append(phi)
+        return torque_diagram, stress, angle
+
+    def check_strength(self, key_sections):
+        result = []
+        for x_start, x_end, _ in key_sections:
+            mid = (x_start + x_end) / 2
+            T = next((T for a, b, T in self.build_internal_torque_distribution() if a <= mid < b), 0)
+            seg = self.find_segment(mid)
+            W = seg.polar_moment_w()
+            tau = T / W
+            ok = tau <= self.allowable_tau
+            result.append((x_start, x_end, T, tau, ok))
+        return result
+    
+    def _get_torque_between(self, x1, x2):
+        for a, b, T in self.build_internal_torque_distribution():
+            if a <= x1 and x2 <= b:
+                return T
+        return 0
+
+    def plot(self, torque_diagram, stress, angles):
+        fig, axs = plt.subplots(4, 1, figsize=(16, 12), sharex=True)
+        plt.subplots_adjust(hspace=0.3)
+
+        # ================== Расчетная схема ==================
+        axs[0].set_title("Расчетная схема вала", pad=20)
+        max_d = max(seg.d for seg in self.segments) if self.segments else 1
+        scale = 0.3
+        rect_scale = 5  # Коэффициент увеличения для заделок
+
+        # Отрисовка заделок (фиксированная высота относительно max диаметра)
+        base_height = max_d * scale
+        support_height = base_height * rect_scale
+
+        # Левая заделка
+        axs[0].add_patch(plt.Rectangle(
+            (-0.2, -support_height/2), 
+            0.2, support_height,
+            color='#2F4F4F', zorder=3
+        ))
+
+        # Правая заделка (если нужно)
+        if self.support_type == 'fixed_both':
+            axs[0].add_patch(plt.Rectangle(
+                (self.total_length(), -support_height/2), 
+                0.2, support_height,
+                color='#2F4F4F', zorder=3
+            ))
+
+        # Сегменты вала с масштабированием по диаметру
+        for seg in self.segments:
+            # Высота пропорциональна реальному диаметру
+            seg_height = seg.d * scale 
+            y_bottom = -seg_height/2  # Центрируем по вертикали
+            
+            axs[0].add_patch(plt.Rectangle(
+                (seg.start, y_bottom), 
+                seg.length, seg_height,
+                facecolor='#F5F5F5', edgecolor='black', lw=1.2
+            ))
+            
+            # Пунктирные линии для кольцевых сечений
+            if seg.section_type in ['thick_ring', 'thin_ring']:
+                for y_offset in [seg_height/4, -seg_height/4]:
+                    axs[0].plot(
+                        [seg.start, seg.end], 
+                        [y_offset + y_bottom, y_offset + y_bottom], 
+                        'k--', lw=1, alpha=0.7
+                    )
+
+        # Крутящие моменты (стрелки)
+        for t in self.torques:
+            dir = 1 if t.value > 0 else -1
+            axs[0].annotate(
+                f'{abs(t.value)} Н·м', 
+                xy=(t.position, 0), 
+                xytext=(0, dir*support_height*0.7),
+                textcoords='offset points',
+                arrowprops=dict(
+                    arrowstyle='->', 
+                    color='red', 
+                    lw=1.5,
+                    mutation_scale=20
+                ),
+                ha='center', 
+                va='bottom' if dir > 0 else 'top'
+            )
+
+        axs[0].set_xlim(-0.5, self.total_length()+0.5)
+        axs[0].set_ylim(-support_height*1.5, support_height*1.5)
+        axs[0].axis('off')
+
+        # ================== Эпюра крутящего момента ==================
+        axs[1].set_title("Эпюра крутящего момента", pad=15)
+        axs[1].set_ylabel("T, Н·м")
+        
+        # Собираем данные для закрашивания
+        x_t = []
+        T_t = []
+        for x_start, x_end, T in torque_diagram:
+            x_t.extend([x_start, x_end])
+            T_t.extend([T, T])
+        
+        axs[1].fill_between(x_t, T_t, 0, where=np.array(T_t) > 0, color='#FFA07A', alpha=0.4)
+        axs[1].fill_between(x_t, T_t, 0, where=np.array(T_t) < 0, color='#FFA07A', alpha=0.4)
+        axs[1].plot(x_t, T_t, 'r-', lw=2)
+        
+        # Подписи значений
+        for x_start, x_end, T in torque_diagram:
+            if T != 0:
+                axs[1].text(
+                    (x_start + x_end)/2, T/2,
+                    f'{T:.1f} Н·м',
+                    ha='center', va='center',
+                    bbox=dict(facecolor='white', edgecolor='none', pad=2)
+                )
+        
+        axs[1].grid(True, linestyle='--', alpha=0.7)
+        axs[1].axhline(0, color='black', lw=1)
+
+        # ================== Эпюра напряжений ==================
+        axs[2].set_title("Эпюра касательных напряжений", pad=15)
+        axs[2].set_ylabel("τ, Па")
+        
+        x_vals = np.linspace(0, self.total_length(), len(stress))
+        axs[2].fill_between(x_vals, stress, color='#98FB98', alpha=0.4)
+        axs[2].plot(x_vals, stress, 'g-', lw=2)
+        
+        # Добавляем подписи в ключевых точках
+        key_points = sorted(set(
+            [0.0, self.total_length()] + 
+            [seg.end for seg in self.segments] + 
+            [t.position for t in self.torques]
+        ))
+        
+        for x in key_points:
+            idx = np.abs(x_vals - x).argmin()
+            axs[2].annotate(
+                f'{stress[idx]:.1f} Па',
+                (x_vals[idx], stress[idx]),
+                xytext=(0, 10),
+                textcoords='offset points',
+                ha='center', va='bottom',bbox=dict(facecolor='white', edgecolor='none', pad=2),
+                arrowprops=dict(arrowstyle='->', color='green', lw=1)
+            )
+        
+        axs[2].grid(True, linestyle='--', alpha=0.7)
+
+        # ================== Эпюра углов закручивания ==================
+        axs[3].set_title("Эпюра углов закручивания", pad=15)
+        axs[3].set_ylabel("θ, рад")
+        axs[3].set_xlabel("Длина вала, м")
+        
+        # Рассчитываем углы для ключевых точек
+        points = sorted(set(
+            [0.0, self.total_length()] + 
+            [seg.end for seg in self.segments] + 
+            [t.position for t in self.torques]
+        ))
+        
+        phi_points = [0.0]
+        for i in range(1, len(points)):
+            delta_x = points[i] - points[i-1]
+            seg = self.find_segment(points[i-1])
+            J = seg.polar_moment()
+            T = self._get_torque_between(points[i-1], points[i])
+            delta_phi = T * delta_x / (J * self.G)
+            phi_points.append(phi_points[-1] + delta_phi)
+        
+        # Закрашивание и график
+        axs[3].fill_between(points, phi_points, color='#87CEEB', alpha=0.4)
+        axs[3].plot(points, phi_points, 'b-o', lw=2, markersize=6, mec='navy')
+        
+        # Подписи углов
+        for x, phi in zip(points, phi_points):
+            axs[3].text(
+                x, phi, f'{phi:.4f} рад',
+                ha='center', va='bottom',
+                bbox=dict(facecolor='white', edgecolor='none', pad=2)
+            )
+        
+        axs[3].grid(True, linestyle='--', alpha=0.7)
+
+        plt.tight_layout()
+        plt.show()
+# ================== Главное меню ==================
+
+def main():
+    while True:
+        print("\nГлавное меню")
+        print("1. Расчет балки на изгиб")
+        print("2. Расчет бруса на растяжение/сжатие")
+        print("3. Расчет вала на кручение")
+        print("0. Выход")
+        
+        choice = input("Выберите действие: ").strip()
+        
+        if choice == '1':
+            calculate_beam()
+        elif choice == '2':
+            calculate_bar()
+        elif choice == '3':
+            calculate_shaft()
+        elif choice == '0':
+            print("Выход из программы")
+            break
+        else:
+            print("Некорректный ввод!")
+
+# ================== Функция расчета балки ==================
+
+def calculate_beam():
+    try:
+        print("\n=== Расчет балки на изгиб ===")
+        length = float_input("Длина балки (м): ", min_val=0.1)
+        
+        # Ввод жесткости сечения
+        E = I = None
+        if choice_input("Задать жесткость сечения (E и I)?", 
+                       ['yes', 'no'], ['Да', 'Нет']) == 'yes':
+            E = float_input("Модуль упругости E (Па): ", min_val=1e3)
+            I = float_input("Момент инерции I (м⁴): ", min_val=1e-6)
+        
+        # Обновленный выбор конфигурации опор:
+        support_config = choice_input(
+            "\nВыберите конфигурацию опор:",
+            options=['fixed', 
+                    'fixed_and_roller',
+                    'fixed_and_movable',  # 1 неподвижная + 1 подвижная
+                    'two_fixed_supports',
+                    'three_supports',
+                    'fixed_and_two_rollers',
+                    'fixed_and_fixed_support', 
+                    'fixed_support_plus_3_rollers'],
+            labels=[
+                'Одна заделка',
+                'Заделка + шарнирно-подвижная опора',
+                'Неподвижная + подвижная опоры', 
+                'Две неподвижные шарнирные опоры',
+                'Три опоры (1 неподвижная и 2 подвижных опоры)',
+                'Заделка + 2 шарнирно-подвижные опоры',
+                'Заделка + Неподвижная опора (2 степени)',
+                '1 Неподвижная + 3 Подвижные опоры (2 степени)'
+            ]
+        )
+
+        # Обработка конфигураций
+        if support_config == 'fixed':
+            pos = float_input("Позиция заделки (м): ", 0.0, length)
+            supports = [{'type': 'fixed', 'position': pos}]
+            
+        elif support_config == 'fixed_and_roller':
+            pos_fixed = float_input("Позиция заделки (м): ", 0.0, length-0.1)
+            pos_roller = float_input("Позиция шарнирно-подвижной опоры (м): ", pos_fixed+0.1, length)
+            supports = [
+                {'type': 'fixed', 'position': pos_fixed},
+                {'type': 'roller', 'position': pos_roller}
+            ]
+        elif support_config == 'fixed_and_two_rollers':
+            pos_fixed = float_input("Позиция заделки (м): ", 0.0, length)
+            pos_r1 = float_input("Позиция первой подвижной опоры (м): ", pos_fixed+0.1, length-0.1)
+            pos_r2 = float_input("Позиция второй подвижной опоры (м): ", pos_r1+0.1, length)
+            supports = [
+                {'type': 'fixed', 'position': pos_fixed},
+                {'type': 'roller', 'position': pos_r1},
+                {'type': 'roller', 'position': pos_r2} 
+            ]
+
+        elif support_config == 'fixed_and_movable':  # 1 неподвижная + 1 подвижная
+            pos_fixed = float_input("Позиция НЕПОДВИЖНОЙ опоры (м): ", 0.0, length-0.1)
+            pos_movable = float_input("Позиция ПОДВИЖНОЙ опоры (м): ", pos_fixed+0.1, length)
+            supports = [
+                {'type': 'fixed_support', 'position': pos_fixed},
+                {'type': 'roller', 'position': pos_movable}
+            ]
+            
+        elif support_config == 'two_fixed_supports':  # 2 неподвижные шарнирные
+            pos1 = float_input("Позиция первой опоры (м): ", 0.0, length-0.1)
+            pos2 = float_input("Позиция второй опоры (м): ", pos1+0.1, length)
+            supports = [
+                {'type': 'fixed_support', 'position': pos1},
+                {'type': 'fixed_support', 'position': pos2}
+            ]
+            
+        elif support_config == 'three_supports':  # 3 опоры
+            pos1 = float_input("Позиция первой опоры (м): ", 0.0, length-0.2)
+            pos2 = float_input("Позиция второй опоры (м): ", pos1+0.1, length-0.1)
+            pos3 = float_input("Позиция третьей опоры (м): ", pos2+0.1, length)
+            supports = [
+                {'type': 'fixed_support', 'position': pos1},
+                {'type': 'roller', 'position': pos2},
+                {'type': 'roller', 'position': pos3}
+            ]
+        
+        elif support_config == 'fixed_and_fixed_support':
+            pos_fixed = float_input("Позиция заделки (м): ", 0.0, length)
+            pos_fixed_sup = float_input("Позиция неподвижной опоры (м): ", pos_fixed + 0.1, length)
+            supports = [
+                {'type': 'fixed', 'position': pos_fixed},
+                {'type': 'fixed_support', 'position': pos_fixed_sup}
+            ]
+        elif support_config == 'fixed_support_plus_3_rollers':
+            pos_fixed = float_input("Позиция неподвижной опоры (м): ", 0.0, length - 0.3)
+            pos_r1 = float_input("Позиция первого ролика (м): ", pos_fixed + 0.1, length - 0.2)
+            pos_r2 = float_input("Позиция второго ролика (м): ", pos_r1 + 0.1, length - 0.1)
+            pos_r3 = float_input("Позиция третьего ролика (м): ", pos_r2 + 0.1, length)
+            supports = [
+                {'type': 'fixed_support', 'position': pos_fixed},
+                {'type': 'roller', 'position': pos_r1},
+                {'type': 'roller', 'position': pos_r2},
+                {'type': 'roller', 'position': pos_r3}
+            ]
+        
+        # Создание объекта балки
+        beam = Beam(length, supports, E, I)
+        
+        # Блок добавления нагрузок
+        print("\nДобавление нагрузок:")
+        while True:
+            load_type = choice_input(
+                "\nТип нагрузки:",
+                options=['force', 'distributed', 'moment', 'done'],
+                labels=[
+                    'Сосредоточенная сила',
+                    'Распределенная нагрузка',
+                    'Сосредоточенный момент',
+                    'Завершить ввод'
+                ]
+            )
+            
+            if load_type == 'done':
+                break
+                
+            if load_type == 'force':
+                value = float_input("Значение силы (Н): ")
+                position = float_input("Позиция от левого конца (м): ", min_val=0, max_val=length)
+                direction = choice_input(
+                    "Направление:",
+                    options=['up', 'down'],
+                    labels=['Вверх', 'Вниз']
+                )
+                beam.add_load(Load('force', value, position, direction=direction))
+                
+            elif load_type == 'distributed':
+                value = float_input("Интенсивность нагрузки (Н/м): ")
+                start = float_input("Начало нагрузки (м): ", min_val=0, max_val=length-0.1)
+                end = float_input("Конец нагрузки (м): ", min_val=start+0.1, max_val=length)
+                direction = choice_input(
+                    "Направление:",
+                    options=['up', 'down'],
+                    labels=['Вверх', 'Вниз']
+                )
+                beam.add_load(Load('distributed', value, start=start, end=end, direction=direction))
+                
+            elif load_type == 'moment':
+                value = float_input("Значение момента (Н·м): ")
+                position = float_input("Позиция от левого конца (м): ", min_val=0, max_val=length)
+                direction = choice_input(
+                    "Направление:",
+                    options=['cw', 'ccw'],
+                    labels=['По часовой', 'Против часовой']
+                )
+                beam.add_load(Load('moment', value, position=position, direction=direction))
+        
+        # Расчет и вывод результатов
+        beam.calculate_reactions()
+        # Расчет момента сопротивления
+        max_moment = beam.get_max_moment()
+        sigma_allow = float_input("\nВведите допускаемое напряжение материала (Па): ", min_val=1e3)
+        required_W = max_moment / sigma_allow if sigma_allow != 0 else 0
+        # Форматирование для консоли
+        if abs(required_W) < 0.001 or abs(required_W) >= 1e6:
+            w_str = f"{required_W:.4e}"
+        else:
+            w_str = f"{required_W:.6f}"
+
+        # Вывод результатов в консоль
+        print("\n=== Результаты расчета ===")
+        print(f"Максимальный изгибающий момент: {max_moment:.2f} Н·м")
+        print(f"Допускаемое напряжение: {sigma_allow:.2e} Па")
+        print(f"Требуемый момент сопротивления сечения: {w_str} м³")
+
+        # Сохраняем параметры для GUI
+        beam.sigma_allow = sigma_allow
+        beam.max_moment = max_moment
+        beam.required_W = required_W
+
+        beam.print_results_table(sigma_allow=sigma_allow)
+        beam.plot_diagrams()
+        # Показываем графический интерфейс
+        viewer = BeamSolutionViewer(beam)
+        viewer.show()        
+    except Exception as e:
+        print(f"Ошибка: {str(e)}")
+    input("\nНажмите Enter для продолжения...")
+
+# ================== Функция расчета бруса ==================
+
+def calculate_bar():
+    print("\n" + "═"*40)
+    print("  РАСЧЕТ БРУСА НА РАСТЯЖЕНИЕ/СЖАТИЕ")
+    print("═"*40)
+
+    E = float_input("Модуль упругости E (Па): ", min_val=1e3)
+    sigma_allow = float_input("Допускаемое напряжение (Па): ", min_val=1e3)
+
+    # NEW: Добавлен выбор типа опор
+    support_type = choice_input(
+        "\nТип закрепления:",
+        options=['fixed_left', 'fixed_both'],
+        labels=['Одна заделка слева', 'Две заделки']
+    )
+    bar = Bar(E, sigma_allow, support_type)
+
+    n_segments = int_input("Количество сегментов: ", min_val=1)
+    for i in range(n_segments):
+        print(f"\nДобавление сегмента {i+1}")
+        L = float_input("  Длина сегмента (м): ", min_val=0.01)
+        area = float_input("  Площадь сечения (м²): ", min_val=1e-6)
+        bar.add_segment(L, area)
+
+    n_forces = int_input("\nКоличество сил: ", min_val=1)
+    for i in range(n_forces):
+        print(f"Сила {i+1}:")
+        pos = float_input("  Положение от левого края (м): ", 
+                         min_val=0, max_val=bar.total_length())
+        val = float_input("  Величина силы (Н, +растяжение/-сжатие): ")
+        bar.add_force(pos, val)
+
+    force_diagram, stresses, displacements = bar.calculate()
+    results = bar.check_strength(force_diagram)
+
+    print("\nРезультаты проверки прочности:")
+    errors = []
+    for x1, x2, N, sigma, ok in results:
+        if not ok:
+            errors.append(f"Участок {x1:.3f}-{x2:.3f} м: σ={sigma/1e6:.2f} МПа > {bar.allowable_sigma/1e6:.2f} МПа")
+
+    if errors:
+        print("❌ Обнаружены проблемы:")
+        print("\n".join(errors))
+    else:
+        print("✅ Все участки соответствуют допустимым напряжениям")
+
+    bar.plot(force_diagram, stresses, displacements)
+    input("\nНажмите Enter для возврата в меню...")
+
+# ================== Функция расчета вала ==================
+
+def calculate_shaft():
+    print("\n" + "═" * 40)
+    print("  РАСЧЕТ ВАЛА НА КРУЧЕНИЕ")
+    print("═" * 40)
+
+    G = float_input("Модуль сдвига G (Па): ", min_val=1e6)
+    tau_allow = float_input("Допускаемое касательное напряжение (Па): ", min_val=1e3)
+    
+    # Выбор типа опор
+    support_type = choice_input(
+        "\nТип закрепления:",
+        options=['fixed_left', 'fixed_both'],
+        labels=['Заделка слева', 'Две заделки']
+    )
+    
+    shaft = Shaft(G, tau_allow, support_type)
+
+    # Остальной код функции остается без изменений
+    n_segments = int_input("Количество сегментов вала: ", min_val=1)
+    for i in range(n_segments):
+        print(f"\nДобавление сегмента {i + 1}")
+        L = float_input("  Длина участка (м): ", min_val=0.01)
+        print("  Тип сечения:")
+        print("1. Круглое\n2. Квадратное\n3. Толстостенное кольцо\n4. Тонкостенное кольцо")
+        section_choice = int_input("Выберите вариант: ", min_val=1, max_val=4)
+        section_map = {1: 'circle', 2: 'square', 3: 'thick_ring', 4: 'thin_ring'}
+        section_type = section_map[section_choice]
+
+        if section_type == 'thick_ring':
+            D = float_input("  Внешний диаметр (м): ", min_val=0.001)
+            d = float_input("  Внутренний диаметр (м): ", min_val=0.0001, max_val=D)
+            shaft.add_segment(L, section_type, d, D=D)
+        elif section_type == 'thin_ring':
+            d = float_input("  Диаметр кольца (м): ", min_val=0.001)
+            t = float_input("  Толщина стенки (м): ", min_val=0.0001)
+            shaft.add_segment(L, section_type, d, t=t)
+        else:
+            d = float_input("  Размер сечения (м): ", min_val=0.001)
+            shaft.add_segment(L, section_type, d)
+
+    n_torques = int_input("\nКоличество крутящих моментов: ", min_val=1)
+    for i in range(n_torques):
+        print(f"Момент {i + 1}:")
+        pos = float_input("  Положение от левого края (м): ", min_val=0, max_val=shaft.total_length())
+        val = float_input("  Величина момента (Н·м, отрицательное — влево): ")
+        shaft.add_torque(pos, val)
+
+    torque_diagram, stresses, angles = shaft.calculate()
+    results = shaft.check_strength(torque_diagram)
+
+    print("\nРезультаты проверки прочности:")
+    errors = [f"Участок {x1:.2f}-{x2:.2f} м: τ = {tau:.2f} > τ_доп ({shaft.allowable_tau:.2f})"
+              for x1, x2, T, tau, ok in results if not ok]
+
+    if errors:
+        print("❌ Обнаружены участки с превышением допустимого напряжения:")
+        for err in errors:
+            print("   -", err)
+    else:
+        print("✅ Все участки проходят по прочности.")
+
+    shaft.plot(torque_diagram, stresses, angles)
+    input("\nНажмите Enter для возврата в меню...")
+
+# Запуск программы
+if __name__ == "__main__":
+    main()
